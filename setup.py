@@ -65,7 +65,7 @@ setup(
         "Brotli>=1.0,<1.1",
         "certifi>=2019.9.11",  # no semver here - this should always be on the last release!
         "click>=7.0,<8",
-        "cryptography>=2.1.4,<2.5",
+        "cryptography>=2.1.4,<2.9",
         "flask>=1.1.1,<1.2",
         "h2>=3.0.1,<4",
         "hyperframe>=5.1.0,<6",
@@ -93,7 +93,7 @@ setup(
             "asynctest>=0.12.0",
             "flake8>=3.7.8,<3.8",
             "Flask>=1.0,<1.2",
-            "mypy>=0.590,<0.591",
+            "mypy>=0.740,<0.741",
             "parver>=0.1,<2.0",
             "pytest-asyncio>=0.10.0,<0.11",
             "pytest-cov>=2.7.1,<3",
