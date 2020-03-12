@@ -1,8 +1,10 @@
 """
-This module is for blocking DNS over HTTPS requests.
+This is mean to be a DNS over HTTPS proxy.
+It intercepts DNS over HTTPS requests and forwards them to another resolver (by default the system resolver)
+and returns the response.
 
 It loads a blacklist of IPs and hostnames that are known to serve DNS over HTTPS requests.
-It also uses headers, query params, and paths to detect DoH (and block it)
+It also uses headers, query params, and paths to detect DoH queries.
 """
 import base64
 import json
@@ -10,6 +12,7 @@ import os
 import re
 import socket
 import urllib.request
+import asyncio
 from typing import List, Tuple, Iterator
 
 import dns.message
@@ -20,6 +23,19 @@ import dns.rdtypes.IN.AAAA
 import dns.resolver
 
 from mitmproxy import ctx, http
+from mitmproxy.log import Log, LogEntry
+
+
+class Logger(Log):
+    LOG_TAG = '[doh proxy]'
+
+    def __call__(self, text, level="info"):
+        text = '{} {}'.format(Logger.LOG_TAG, text)
+        asyncio.get_event_loop().call_soon(
+            self.master.addons.trigger, "log", LogEntry(text, level)
+        )
+
+logger = Logger(master=ctx.log.master)
 
 # filename we'll save the blacklist to so we don't have to re-generate it every time
 blacklist_filename = 'blacklist.json'
@@ -38,7 +54,7 @@ additional_doh_ips: List[str] = [
 def get_doh_providers() -> Iterator[dict]:
     """
     Scrape a list of DoH providers from curl's wiki page.
-    
+
     :return: a generator of dicts containing information about the DoH providers
     """
     https_url_re = re.compile(r'https://'
@@ -99,7 +115,7 @@ def get_doh_providers() -> Iterator[dict]:
 def get_ips(hostname: str) -> List[str]:
     """
     Lookup all A and AAAA records for given hostname
-    
+
     :param hostname: the name to lookup
     :return: a list of IP addresses returned
     """
@@ -148,9 +164,9 @@ def load_blacklist() -> Tuple[List[str], List[str]]:
 
 
 # load DoH hostnames and IP addresses to block
-ctx.log.info('Loading DoH blacklist...')
+logger.info('Loading DoH blacklist...')
 doh_hostnames, doh_ips = load_blacklist()
-ctx.log.info('DoH blacklist loaded')
+logger.info('DoH blacklist loaded')
 
 # convert to sets for faster lookups
 doh_hostnames = set(doh_hostnames)
@@ -165,22 +181,40 @@ class DohProxyAddonBase:
         raise NotImplementedError
 
     def request(self, flow: http.HTTPFlow) -> None:
-        # ignore anything that's not a GET or POST request
-        if flow.request.method not in ['GET', 'POST']:
-            return
-
         # if the request looks like a DNS over HTTPS query, call self.proxy_doh_query()
         for check in DohProxyAddonBase.doh_query_checks():
             is_doh = check(flow)
             if is_doh:
-                ctx.log.info("DNS over HTTPS request detected because '{}'".format(
+                logger.info("DNS over HTTPS request detected because '{}'".format(
                     ' '.join(check.__name__[1:].split('_'))))
+                if flow.request.method == 'OPTIONS':
+                    self.handle_doh_options_request(flow)
+                    break
+
                 try:
                     self.handle_doh_query(flow)
                 except Exception as e:
-                    ctx.log.error('Error occurred while proxying DoH query: {}'.format(e))
+                    logger.error('Error occurred while proxying DoH query: {}'.format(e))
                 finally:
                     break
+
+    @staticmethod
+    def handle_doh_options_request(flow: http.HTTPFlow) -> None:
+        print('Got request method:', flow.request.method)
+        headers = {
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Allow-Methods': 'GET, POST',
+        }
+        if 'Origin' in flow.request.headers:
+            headers['Access-Control-Allow-Origin'] = flow.request.headers['Origin']
+        else:
+            headers['Access-Control-Allow-Origin'] = '*'
+
+        flow.response = http.HTTPResponse.make(
+            status_code=200,  # (optional) status code
+            content=b'',
+            headers=headers  # (optional) headers
+        )
 
     @staticmethod
     def decode_dns_request(flow: http.HTTPFlow) -> dns.message.Message:
@@ -321,10 +355,10 @@ class DohProxyAddon(DohProxyAddonBase):
         assert n_sent == len(q_wire)
         r_wire = self._upstream_sock.recv(65536)
         headers = {'Content-Type': 'application/dns-message'}
-        if 'Origin' in flow.request.headers:
-            headers['Access-Control-Allow-Origin'] = flow.request.headers['Origin']
-        # else:
-        #     headers['Access-Control-Allow-Origin'] = '*'
+        if 'origin' in flow.request.headers:
+            headers['Access-Control-Allow-Origin'] = flow.request.headers['origin']
+        else:
+            headers['Access-Control-Allow-Origin'] = '*'
 
         flow.response = http.HTTPResponse.make(
             status_code=200,  # (optional) status code
@@ -336,7 +370,7 @@ class DohProxyAddon(DohProxyAddonBase):
 ip = os.getenv('DOH_PROXY_UPSTREAM_IP', dns.resolver.Resolver().nameservers[0])
 port = os.getenv('DOH_PROXY_UPSTREAM_PORT', 53)
 
-ctx.log.info('DoH Proxy Addon forwarding DNS queries to {}#{}'.format(ip, port))
+logger.info('DoH Proxy Addon forwarding DNS queries to {}#{}'.format(ip, port))
 
 addons = [
     DohProxyAddon(ip, port)
