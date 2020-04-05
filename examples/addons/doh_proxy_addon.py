@@ -23,6 +23,7 @@ import dns.rdtypes.IN.AAAA
 import dns.resolver
 
 from mitmproxy import ctx, http
+from mitmproxy.options import Options
 from mitmproxy.log import Log, LogEntry
 
 
@@ -166,23 +167,33 @@ def load_blacklist() -> Tuple[List[str], List[str]]:
 # load DoH hostnames and IP addresses to block
 logger.info('Loading DoH blacklist...')
 doh_hostnames, doh_ips = load_blacklist()
-logger.info('DoH blacklist loaded')
 
 # convert to sets for faster lookups
 doh_hostnames = set(doh_hostnames)
 doh_ips = set(doh_ips)
 
+logger.info('Loaded {} hostnames and {} IP addresses into DoH blacklist'.format(len(doh_hostnames), len(doh_ips)))
 
-class DohProxyAddonBase:
+
+class DohAddonBase:
     def __init__(self, *args, **kwargs):
         pass
 
     def handle_doh_query(self, flow: http.HTTPFlow) -> None:
-        raise NotImplementedError
+        pass
+
+    def load(self, loader: Options):
+        loader.add_option(
+            name='doh-action',
+            typespec=bool,
+            default=None,
+            help='Attempt to detect DNS over HTTPS queries and do something with them',
+            choices=[]
+        )
 
     def request(self, flow: http.HTTPFlow) -> None:
         # if the request looks like a DNS over HTTPS query, call self.proxy_doh_query()
-        for check in DohProxyAddonBase.doh_query_checks():
+        for check in DohAddonBase.doh_query_checks():
             is_doh = check(flow)
             if is_doh:
                 logger.info("DNS over HTTPS request detected because '{}'".format(
@@ -200,7 +211,6 @@ class DohProxyAddonBase:
 
     @staticmethod
     def handle_doh_options_request(flow: http.HTTPFlow) -> None:
-        print('Got request method:', flow.request.method)
         headers = {
             'Access-Control-Allow-Headers': 'Content-Type',
             'Access-Control-Allow-Methods': 'GET, POST',
@@ -236,19 +246,36 @@ class DohProxyAddonBase:
         elif flow.request.method == 'POST':
             wire = flow.request.content
             return dns.message.from_wire(wire)
-        raise ValueError('Expecting request method to be GET or POST, got {} instead'.format(flow.request.method))
+        else:
+            raise ValueError('Expecting request method to be GET or POST, got {} instead'.format(flow.request.method))
 
     @staticmethod
     def doh_query_checks():
         return [
-            DohProxyAddonBase._has_dns_message_content_type,
-            DohProxyAddonBase._request_has_dns_query_string,
-            # for dns json I'll have to do some additional processing
-            # leave it out for now
+            DohAddonBase._has_dns_message_content_type,
+            DohAddonBase._request_has_dns_query_string,
+
+            # For dns json we'd have to do some additional processing
+            # in order to load it as a DNS message,
+            # so we're just going to forget it for now.
             # DohProxyAddonBase._request_is_dns_json,
-            DohProxyAddonBase._requested_hostname_is_in_doh_blacklist,
-            DohProxyAddonBase._request_has_doh_looking_path
+
+            DohAddonBase._requested_hostname_is_in_doh_blacklist,
+            DohAddonBase._request_has_doh_looking_path
         ]
+
+    @staticmethod
+    def _has_dns_message_in_accept_header(flow: http.HTTPFlow) -> bool:
+        """
+        Check if HTTP request has a DNS-looking 'Accept' header
+
+        :param flow: mitmproxy flow
+        :return: True if 'Accept' header is DNS-looking, False otherwise
+        """
+        doh_content_types = {
+            'application/dns-message'
+        }
+        return 'Accept' in flow.request.headers and flow.request.headers['Accept'] in doh_content_types
 
     @staticmethod
     def _has_dns_message_content_type(flow: http.HTTPFlow) -> bool:
@@ -261,10 +288,7 @@ class DohProxyAddonBase:
         doh_content_types = {
             'application/dns-message'
         }
-        if 'Content-Type' in flow.request.headers:
-            if flow.request.headers['Content-Type'] in doh_content_types:
-                return True
-        return False
+        return 'Content-Type' in flow.request.headers and flow.request.headers['Content-Type'] in doh_content_types
 
     @staticmethod
     def _request_has_dns_query_string(flow):
@@ -331,7 +355,7 @@ class DohProxyAddonBase:
         return hostname in doh_hostnames or hostname in doh_ips or ip in doh_ips
 
 
-class DohProxyAddon(DohProxyAddonBase):
+class DohProxyAddon(DohAddonBase):
     def __init__(self, upstream_addr: str, upstream_port: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -367,11 +391,31 @@ class DohProxyAddon(DohProxyAddonBase):
         )
 
 
+class BlockDohAddon(DohAddonBase):
+
+    def handle_doh_query(self, flow: http.HTTPFlow) -> None:
+        flow.kill()
+
+class LogDohAddon(DohAddonBase):
+
+    def handle_doh_query(self, flow: http.HTTPFlow) -> None:
+        query = self.decode_dns_request(flow)
+        logger.info('query for {} from {} to {}'.format(query.question[0].name.to_text(), flow.client_conn.address.domain, flow.server_conn.address.domain))
+
 ip = os.getenv('DOH_PROXY_UPSTREAM_IP', dns.resolver.Resolver().nameservers[0])
 port = os.getenv('DOH_PROXY_UPSTREAM_PORT', 53)
 
 logger.info('DoH Proxy Addon forwarding DNS queries to {}#{}'.format(ip, port))
 
+LOG_DOH = 'log-doh'
+BLOCK_DOH = 'block-doh'
+PROXY_DOH = 'proxy-doh'
+
+doh_actions = {
+    LOG_DOH: LogDohAddon,
+    BLOCK_DOH: BlockDohAddon,
+    PROXY_DOH: DohProxyAddon
+}
+
 addons = [
-    DohProxyAddon(ip, port)
 ]
