@@ -7,6 +7,7 @@ It loads a blacklist of IPs and hostnames that are known to serve DNS over HTTPS
 It also uses headers, query params, and paths to detect DoH queries.
 """
 import base64
+import functools
 import json
 import os
 import re
@@ -25,7 +26,6 @@ import dns.resolver
 from mitmproxy import ctx, http
 from mitmproxy.options import Options
 from mitmproxy.log import Log, LogEntry
-
 
 class Logger(Log):
     LOG_TAG = '[doh proxy]'
@@ -148,11 +148,13 @@ def load_blacklist() -> Tuple[List[str], List[str]]:
             j = json.load(fp)
         doh_hostnames, doh_ips = j['hostnames'], j['ips']
     else:
-        doh_hostnames = list([i['hostname'] for i in get_doh_providers()])
-        doh_ips = list()
-        for hostname in doh_hostnames:
-            ips = get_ips(hostname)
-            doh_ips.extend(ips)
+        logger.info('skipping blacklist loading for now')
+        return [], []
+        # doh_hostnames = list([i['hostname'] for i in get_doh_providers()])
+        # doh_ips = list()
+        # for hostname in doh_hostnames:
+        #     ips = get_ips(hostname)
+        #     doh_ips.extend(ips)
     doh_hostnames.extend(additional_doh_names)
     doh_ips.extend(additional_doh_ips)
     with open(blacklist_filename, 'w') as fp:
@@ -175,56 +177,15 @@ doh_ips = set(doh_ips)
 logger.info('Loaded {} hostnames and {} IP addresses into DoH blacklist'.format(len(doh_hostnames), len(doh_ips)))
 
 
-class DohAddonBase:
-    def __init__(self, *args, **kwargs):
+class DohHandler:
+    def up(self):
         pass
 
-    def handle_doh_query(self, flow: http.HTTPFlow) -> None:
+    def down(self):
         pass
 
-    def load(self, loader: Options):
-        loader.add_option(
-            name='doh-action',
-            typespec=bool,
-            default=None,
-            help='Attempt to detect DNS over HTTPS queries and do something with them',
-            choices=[]
-        )
-
-    def request(self, flow: http.HTTPFlow) -> None:
-        # if the request looks like a DNS over HTTPS query, call self.proxy_doh_query()
-        for check in DohAddonBase.doh_query_checks():
-            is_doh = check(flow)
-            if is_doh:
-                logger.info("DNS over HTTPS request detected because '{}'".format(
-                    ' '.join(check.__name__[1:].split('_'))))
-                if flow.request.method == 'OPTIONS':
-                    self.handle_doh_options_request(flow)
-                    break
-
-                try:
-                    self.handle_doh_query(flow)
-                except Exception as e:
-                    logger.error('Error occurred while proxying DoH query: {}'.format(e))
-                finally:
-                    break
-
-    @staticmethod
-    def handle_doh_options_request(flow: http.HTTPFlow) -> None:
-        headers = {
-            'Access-Control-Allow-Headers': 'Content-Type',
-            'Access-Control-Allow-Methods': 'GET, POST',
-        }
-        if 'Origin' in flow.request.headers:
-            headers['Access-Control-Allow-Origin'] = flow.request.headers['Origin']
-        else:
-            headers['Access-Control-Allow-Origin'] = '*'
-
-        flow.response = http.HTTPResponse.make(
-            status_code=200,  # (optional) status code
-            content=b'',
-            headers=headers  # (optional) headers
-        )
+    def handle(self, flow: http.HTTPFlow):
+        pass
 
     @staticmethod
     def decode_dns_request(flow: http.HTTPFlow) -> dns.message.Message:
@@ -249,19 +210,177 @@ class DohAddonBase:
         else:
             raise ValueError('Expecting request method to be GET or POST, got {} instead'.format(flow.request.method))
 
+
+class ProxyDohHandler(DohHandler):
+    def __init__(self, upstream_addr: str, upstream_port: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._upstream_addr = upstream_addr
+        self._upstream_port = upstream_port
+        self._upstream_sock = None
+
+    def up(self):
+        # setup client socket for upstream server
+        af = dns.inet.af_for_address(self._upstream_addr)
+        self._upstream_sock = socket.socket(af, socket.SOCK_DGRAM, 0)
+        self._upstream_sock.connect((self._upstream_addr, self._upstream_port))
+
+    def down(self):
+        try:
+            self._upstream_sock.close()
+        except Exception:
+            pass
+
+    def handle(self, flow: http.HTTPFlow) -> None:
+        """
+        Decode DNS query from HTTP flow, send it to upstream DNS server, and return HTTP response containing answer
+
+        :param flow: the HTTP request to proxy
+        """
+        q = self.decode_dns_request(flow)
+        q_wire = q.to_wire()
+        n_sent = self._upstream_sock.send(q_wire)
+        assert n_sent == len(q_wire)
+        r_wire = self._upstream_sock.recv(65536)
+        headers = {'Content-Type': 'application/dns-message'}
+        if 'origin' in flow.request.headers:
+            headers['Access-Control-Allow-Origin'] = flow.request.headers['origin']
+        else:
+            headers['Access-Control-Allow-Origin'] = '*'
+
+        flow.response = http.HTTPResponse.make(
+            status_code=200,  # (optional) status code
+            content=r_wire,
+            headers=headers  # (optional) headers
+        )
+
+class BlockDohHandler(DohHandler):
+    def handle(self, flow: http.HTTPFlow) -> None:
+        flow.kill()
+
+class LogDohHandler(DohHandler):
+    def handle(self, flow: http.HTTPFlow) -> None:
+        query = self.decode_dns_request(flow)
+        logger.info(
+            'query for {} from {} to {}'.format(query.question[0].name.to_text(), flow.client_conn.address.domain,
+                                                flow.server_conn.address.domain))
+
+LOG_DOH = 'log'
+BLOCK_DOH = 'block'
+PROXY_DOH = 'proxy'
+NOTHING = 'nothing'
+
+doh_handlers = {
+    LOG_DOH: LogDohHandler,
+    BLOCK_DOH: BlockDohHandler,
+    PROXY_DOH: ProxyDohHandler,
+    NOTHING: DohHandler
+}
+doh_handler_name = os.getenv('DOH_HANDLE', NOTHING)
+doh_handler = doh_handlers.get(doh_handler_name)
+if doh_handler is None:
+    raise ValueError('Environment variable DOH_ACTION is set to something invalid \"{}\". Must be one of {}'.format(
+        doh_handler_name, list(doh_handlers.keys())
+    ))
+_default_nameserver = dns.resolver.Resolver().nameservers[0]
+if doh_handler_name == PROXY_DOH:
+    ip = os.getenv('DOH_PROXY_UPSTREAM_IP', _default_nameserver)
+    port = os.getenv('DOH_PROXY_UPSTREAM_PORT', 53)
+    doh_handler_init = functools.partial(doh_handler, ip, port)
+else:
+    doh_handler_init = doh_handler
+
+
+# noinspection PyArgumentList
+class DohAddon:
+    def __init__(self):
+        self.doh_handler = doh_handler_init()
+
+    def load(self, loader: Options):
+        loader.add_option(
+            name='dohhandler',
+            typespec=str,
+            default=NOTHING,
+            help='What do do when a DNS over HTTPS query is detected',
+            choices=list(doh_handlers.keys()),
+        )
+        loader.add_option(
+            name='dohproxyaddr',
+            typespec=str,
+            default=_default_nameserver,
+            help='Address of upstream DNS to proxy requests to',
+        )
+        loader.add_option(
+            name='dohproxyport',
+            typespec=int,
+            default=53,
+            help='Port to proxy DNS requests to. Default is 53'
+        )
+
+    def configure(self, updates):
+        if 'dohhandler' in updates:
+            if ctx.options.dohhandler is not None:
+                logger.info('Setting up DoH handler...')
+                self.doh_handler.down()
+                if ctx.options.dohhandler == PROXY_DOH:
+                    self.doh_handler = ProxyDohHandler(ctx.options.dohproxyaddr, ctx.options.dohproxyport)
+                else:
+                    self.doh_handler = doh_handlers[ctx.options.dohhandler]()
+                self.doh_handler.up()
+                logger.info('DoH handler up and running!')
+
+    def handle_doh(self, flow: http.HTTPFlow) -> None:
+        if isinstance(self.doh_handler, DohHandler):
+            self.doh_handler.handle(flow)
+
+    def request(self, flow: http.HTTPFlow) -> None:
+        # if the request looks like a DNS over HTTPS query, call self.proxy_doh_query()
+        for check in DohAddon.doh_query_checks():
+            is_doh = check(flow)
+            if is_doh:
+                logger.info("DNS over HTTPS request detected because '{}'".format(
+                    ' '.join(check.__name__[1:].split('_'))))
+                if flow.request.method == 'OPTIONS':
+                    self.handle_doh_options_request(flow)
+                    break
+
+                try:
+                    self.doh_handler.handle(flow)
+                except Exception as e:
+                    logger.error('Error occurred while proxying DoH query: {}'.format(e))
+                finally:
+                    break
+
+    @staticmethod
+    def handle_doh_options_request(flow: http.HTTPFlow) -> None:
+        headers = {
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Allow-Methods': 'GET, POST',
+        }
+        if 'Origin' in flow.request.headers:
+            headers['Access-Control-Allow-Origin'] = flow.request.headers['Origin']
+        else:
+            headers['Access-Control-Allow-Origin'] = '*'
+
+        flow.response = http.HTTPResponse.make(
+            status_code=200,  # (optional) status code
+            content=b'',
+            headers=headers  # (optional) headers
+        )
+
     @staticmethod
     def doh_query_checks():
         return [
-            DohAddonBase._has_dns_message_content_type,
-            DohAddonBase._request_has_dns_query_string,
+            DohAddon._has_dns_message_content_type,
+            DohAddon._request_has_dns_query_string,
 
             # For dns json we'd have to do some additional processing
             # in order to load it as a DNS message,
             # so we're just going to forget it for now.
             # DohProxyAddonBase._request_is_dns_json,
 
-            DohAddonBase._requested_hostname_is_in_doh_blacklist,
-            DohAddonBase._request_has_doh_looking_path
+            DohAddon._requested_hostname_is_in_doh_blacklist,
+            DohAddon._request_has_doh_looking_path
         ]
 
     @staticmethod
@@ -354,68 +473,6 @@ class DohAddonBase:
         ip = flow.server_conn.address
         return hostname in doh_hostnames or hostname in doh_ips or ip in doh_ips
 
-
-class DohProxyAddon(DohAddonBase):
-    def __init__(self, upstream_addr: str, upstream_port: int, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        self._upstream_addr = upstream_addr
-        self._upstream_port = upstream_port
-
-        # setup client socket for upstream server
-        af = dns.inet.af_for_address(self._upstream_addr)
-        self._upstream_sock = socket.socket(af, socket.SOCK_DGRAM, 0)
-        self._upstream_sock.connect((self._upstream_addr, self._upstream_port))
-
-    def handle_doh_query(self, flow: http.HTTPFlow) -> None:
-        """
-        Decode DNS query from HTTP flow, send it to upstream DNS server, and return HTTP response containing answer
-
-        :param flow: the HTTP request to proxy
-        """
-        q = self.decode_dns_request(flow)
-        q_wire = q.to_wire()
-        n_sent = self._upstream_sock.send(q_wire)
-        assert n_sent == len(q_wire)
-        r_wire = self._upstream_sock.recv(65536)
-        headers = {'Content-Type': 'application/dns-message'}
-        if 'origin' in flow.request.headers:
-            headers['Access-Control-Allow-Origin'] = flow.request.headers['origin']
-        else:
-            headers['Access-Control-Allow-Origin'] = '*'
-
-        flow.response = http.HTTPResponse.make(
-            status_code=200,  # (optional) status code
-            content=r_wire,
-            headers=headers  # (optional) headers
-        )
-
-
-class BlockDohAddon(DohAddonBase):
-
-    def handle_doh_query(self, flow: http.HTTPFlow) -> None:
-        flow.kill()
-
-class LogDohAddon(DohAddonBase):
-
-    def handle_doh_query(self, flow: http.HTTPFlow) -> None:
-        query = self.decode_dns_request(flow)
-        logger.info('query for {} from {} to {}'.format(query.question[0].name.to_text(), flow.client_conn.address.domain, flow.server_conn.address.domain))
-
-ip = os.getenv('DOH_PROXY_UPSTREAM_IP', dns.resolver.Resolver().nameservers[0])
-port = os.getenv('DOH_PROXY_UPSTREAM_PORT', 53)
-
-logger.info('DoH Proxy Addon forwarding DNS queries to {}#{}'.format(ip, port))
-
-LOG_DOH = 'log-doh'
-BLOCK_DOH = 'block-doh'
-PROXY_DOH = 'proxy-doh'
-
-doh_actions = {
-    LOG_DOH: LogDohAddon,
-    BLOCK_DOH: BlockDohAddon,
-    PROXY_DOH: DohProxyAddon
-}
-
 addons = [
+    DohAddon()
 ]
